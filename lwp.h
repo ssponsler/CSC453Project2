@@ -1,153 +1,100 @@
+#include <sys/types.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdio.h>
+#include "rr.h"
+#include "fp.h"
+
 #ifndef LWPH
 #define LWPH
-#include <sys/types.h>
 
-/***************
- *  DO NOT MODIFY THIS FILE!!!!
- **************/
-
-#ifdef __i386
-typedef unsigned long ptr_int_t;
-#define PTR_INT_T_FMT "lu"
-#else
-#ifdef __x86_64
-typedef unsigned long long ptr_int_t;
-#define PTR_INT_T_FMT "llu"
-#else
-#error "lwp.c doesn't support this arch."
+#ifndef TRUE
+#define TRUE 1
 #endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#if defined(__x86_64)
+
+void *malloc(size_t size);
+void free(void *_Nullable);
+void exit(int status);
+
+typedef struct __attribute__ ((aligned(16))) __attribute__ ((packed))
+registers {
+  unsigned long rax;            /* the sixteen architecturally-visible regs. */
+  unsigned long rbx;
+  unsigned long rcx;
+  unsigned long rdx;
+  unsigned long rsi;
+  unsigned long rdi;
+  unsigned long rbp;
+  unsigned long rsp;
+  unsigned long r8;
+  unsigned long r9;
+  unsigned long r10;
+  unsigned long r11;
+  unsigned long r12;
+  unsigned long r13;
+  unsigned long r14;
+  unsigned long r15;
+  struct fxsave fxsave;   /* space to save floating point state */
+} rfile;
+#else
+  #error "This only works on x86 for now"
 #endif
 
+typedef unsigned long tid_t;
+#define NO_THREAD 0             /* an always invalid thread id */
 
-typedef struct context_st {
-  unsigned long pid;            /* lightweight process id  */
-  ptr_int_t *stack;         /* pointer to stack returned by malloc() */
-  unsigned long stacksize;      /* Size of allocated stack */
-  ptr_int_t *sp;            /* current stack pointer   */
-  /*  .... other things if necessary ... */
-} lwp_context;
+typedef struct threadinfo_st *thread;
+typedef struct threadinfo_st {
+  tid_t         tid;            /* lightweight process id  */
+  unsigned long *stack;         /* Base of allocated stack */
+  size_t        stacksize;      /* Size of allocated stack */
+  rfile         state;          /* saved registers         */
+  unsigned int  status;         /* exited? exit status?    */
+  thread        lib_one;        /* Two pointers reserved   */
+  thread        lib_two;        /* for use by the library  */
+  thread        sched_one;      /* Two more for            */
+  thread        sched_two;      /* schedulers to use       */
+  thread        exited;         /* and one for lwp_wait()  */
+} context;
 
+typedef int (*lwpfun)(void *);  /* type for lwp function */
 
-/* Process context information.  "Normally" these would be declared
- * static so that nobody outside the file could look at them, but
- * since we want to make it possible for the user to supply an external
- * scheduling function we need to make these available.
- *   (Not really.  A better way would be to have the user supply a comparison
- *    function, but that would make the scheduler much more complicated.)
- */
-extern lwp_context lwp_ptable[];/* the process table           */
-extern int lwp_procs;           /* the current number of LWPs  */
-extern int lwp_running;         /* the index of the currently running LWP */
-
-
-typedef void (*lwpfun)(void *); /* type for lwp function */
-typedef int  (*schedfun)(void); /* type for scheduler function */
+/* Tuple that describes a scheduler */
+typedef struct scheduler {
+  void   (*init)(void);            /* initialize any structures     */
+  void   (*shutdown)(void);        /* tear down any structures      */
+  void   (*admit)(thread new);     /* add a thread to the pool      */
+  void   (*remove)(thread victim); /* remove a thread from the pool */
+  thread (*next)(void);            /* select a thread to schedule   */
+  int    (*qlen)(void);            /* number of ready threads       */
+} *scheduler;
 
 /* lwp functions */
-extern int  new_lwp(lwpfun,void *,size_t);
-extern void lwp_exit();
-extern int  lwp_getpid();
-extern void lwp_yield();
-extern void lwp_start();
-extern void lwp_stop();
-extern void lwp_set_scheduler(schedfun sched);
+extern tid_t lwp_create(lwpfun,void *args);
+extern void  lwp_exit(int status);
+extern tid_t lwp_gettid(void);
+extern void  lwp_yield(void);
+extern void  lwp_start(void);
+extern tid_t lwp_wait(int *);
+extern void lwp_wrap(lwpfun fun, void * arg);
+extern void lwp_set_scheduler(scheduler fun);
+extern scheduler lwp_get_scheduler(void);
+extern thread tid2thread(tid_t tid);
 
-/* Macros for stack manipulation:
- *
- *  SAVE_STATE()    Pushes all general (non floating-point) registers on the
- *                  stack except the stack pointer.
- *  RESTORE_STATE() Pops all general (non floating-point) registers saved
- *                  by SAVE_STATE() off the stack in reverse order.  RS()
- *                  also copies the base pointer to the stack pointer as
- *                  is done by the "leave" instruction in case the compiler
- *                  optimizes that away.
- *  GetSP(var)      Sets the given variable to the current value of the
- *                  stack pointer.
- *  SetSP(var)      Sets the stack pointer to the current value of the
- *                  given variable.
- *
- * These macros should ONLY be used as the very first or very last
- * act of a function.
- */
-#ifdef __i386         /* X86 only code */
+/* for lwp_wait */
+#define TERMOFFSET        8
+#define MKTERMSTAT(a,b)   ( (a)<<TERMOFFSET | ((b) & ((1<<TERMOFFSET)-1)) )
+#define LWP_TERM          1
+#define LWP_LIVE          0
+#define LWPTERMINATED(s)  ( (((s)>>TERMOFFSET)&LWP_TERM) == LWP_TERM )
+#define LWPTERMSTAT(s)    ( (s) & ((1<<TERMOFFSET)-1) )
 
-#define BAILSIGNAL SIGSTKFLT
-
-#define SAVE_STATE() \
-  asm("pushl %%eax":: );\
-  asm("pushl %%ebx":: );\
-  asm("pushl %%ecx":: );\
-  asm("pushl %%edx":: );\
-  asm("pushl %%esi":: );\
-  asm("pushl %%edi":: );\
-  asm("pushl %%ebp":: )
-
-#define GetSP(sp)  asm("movl  %%esp,%0": "=r" (sp) : )
-
-#define SetSP(sp)  asm("movl  %0,%%esp":           : "r" (sp)  )
-
-#define RESTORE_STATE() \
-  asm("popl  %%ebp":: );\
-  asm("popl  %%edi":: );\
-  asm("popl  %%esi":: );\
-  asm("popl  %%edx":: );\
-  asm("popl  %%ecx":: );\
-  asm("popl  %%ebx":: );\
-  asm("popl  %%eax":: );\
-  asm("movl  %%ebp,%%esp":: )  /* restore esp in case leave is not used */
-
-#else /* END x86 only code */
-#ifdef __x86_64
-#define BAILSIGNAL SIGSTKFLT
-
-#define SAVE_STATE() \
-  asm("pushq %%rax":: );\
-  asm("pushq %%rbx":: );\
-  asm("pushq %%rcx":: );\
-  asm("pushq %%rdx":: );\
-  asm("pushq %%rsi":: );\
-  asm("pushq %%rdi":: );\
-  asm("pushq %%r8":: );\
-  asm("pushq %%r9":: );\
-  asm("pushq %%r10":: );\
-  asm("pushq %%r11":: );\
-  asm("pushq %%r12":: );\
-  asm("pushq %%r13":: );\
-  asm("pushq %%r14":: );\
-  asm("pushq %%r15":: );\
-  asm("pushq %%rbp":: )
-
-#define GetSP(sp)  asm("movq  %%rsp,%0": "=r" (sp) : )
-
-#define SetSP(sp)  asm("movq  %0,%%rsp":           : "r" (sp)  )
-
-#define RESTORE_STATE() \
-  asm("popq  %%rbp":: );\
-  asm("popq  %%r15":: );\
-  asm("popq  %%r14":: );\
-  asm("popq  %%r13":: );\
-  asm("popq  %%r12":: );\
-  asm("popq  %%r11":: );\
-  asm("popq  %%r10":: );\
-  asm("popq  %%r9":: );\
-  asm("popq  %%r8":: );\
-  asm("popq  %%rdi":: );\
-  asm("popq  %%rsi":: );\
-  asm("popq  %%rdx":: );\
-  asm("popq  %%rcx":: );\
-  asm("popq  %%rbx":: );\
-  asm("popq  %%rax":: );\
-  asm("movq  %%rbp,%%rsp":: )  /* restore esp in case leave is not used */
-
-
-#else
-#error "This stack manipulation code can only be compiled on an x86 or x86_64"
-#endif
-#endif
-
-/* LWP_PROC_LIMIT is the maximum number of LWPs active */
-#ifndef LWP_PROC_LIMIT
-#define LWP_PROC_LIMIT 30
-#endif
+/* prototypes for asm functions */
+void swap_rfiles(rfile *old, rfile *new);
 
 #endif
